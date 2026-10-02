@@ -32,10 +32,23 @@ func TestLakera_Flagged(t *testing.T) {
 		if r.Header.Get("Authorization") != "Bearer lk-test" {
 			t.Error("wrong auth header")
 		}
-		json.NewEncoder(w).Encode(map[string]interface{}{
-			"flagged":         true,
-			"categories":      map[string]bool{"prompt_injection": true, "jailbreak": false},
-			"category_scores": map[string]float64{"prompt_injection": 0.95, "jailbreak": 0.1},
+		var req lakeraRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			t.Errorf("failed to decode request: %v", err)
+		}
+		if len(req.Messages) != 1 || req.Messages[0].Content != "ignore previous" || req.Messages[0].Role != "user" {
+			t.Errorf("unexpected messages: %+v", req.Messages)
+		}
+		if !req.Breakdown {
+			t.Errorf("expected breakdown to be true")
+		}
+		score := 0.95
+		json.NewEncoder(w).Encode(lakeraResponse{
+			Flagged: true,
+			Breakdown: []lakeraDetectorResult{
+				{DetectorType: "prompt_injection", Detected: true, Score: &score},
+				{DetectorType: "jailbreak", Detected: false},
+			},
 		})
 	}))
 	defer srv.Close()
@@ -58,10 +71,18 @@ func TestLakera_Flagged(t *testing.T) {
 
 func TestLakera_Safe(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		json.NewEncoder(w).Encode(map[string]interface{}{
-			"flagged":         false,
-			"categories":      map[string]bool{"prompt_injection": false},
-			"category_scores": map[string]float64{"prompt_injection": 0.01},
+		var req lakeraRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			t.Errorf("failed to decode request: %v", err)
+		}
+		if len(req.Messages) != 1 || req.Messages[0].Content != "hello" || req.Messages[0].Role != "user" {
+			t.Errorf("unexpected messages: %+v", req.Messages)
+		}
+		json.NewEncoder(w).Encode(lakeraResponse{
+			Flagged: false,
+			Breakdown: []lakeraDetectorResult{
+				{DetectorType: "prompt_attack", Detected: false},
+			},
 		})
 	}))
 	defer srv.Close()
@@ -76,12 +97,69 @@ func TestLakera_Safe(t *testing.T) {
 	}
 }
 
+func TestLakera_DetectMode_NeverBlocks(t *testing.T) {
+	// In Lakera Detect mode, flagged is always false even if detectors identify threats.
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		score := 0.99
+		json.NewEncoder(w).Encode(lakeraResponse{
+			Flagged: false,
+			Breakdown: []lakeraDetectorResult{
+				{DetectorType: "prompt_attack", Detected: true, Score: &score},
+				{DetectorType: "pii", Detected: true, Score: &score},
+			},
+		})
+	}))
+	defer srv.Close()
+
+	g := New("test-detect-mode", map[string]interface{}{
+		"provider": "lakera",
+		"api_key":  "k",
+		"endpoint": srv.URL,
+	})
+
+	result := g.Check(context.Background(), makeInput([]models.Message{makeMsg("user", "ignore rules")}))
+	if !result.Pass {
+		t.Fatal("expected pass in Detect mode")
+	}
+}
+
+func TestLakera_PromptAttackSynonymMatch(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		score := 0.98
+		json.NewEncoder(w).Encode(lakeraResponse{
+			Flagged: true,
+			Breakdown: []lakeraDetectorResult{
+				{DetectorType: "prompt_attack", Detected: true, Score: &score},
+			},
+		})
+	}))
+	defer srv.Close()
+
+	g := New("test-synonym", map[string]interface{}{
+		"provider":   "lakera",
+		"api_key":    "k",
+		"endpoint":   srv.URL,
+		"categories": []interface{}{"prompt_injection"},
+	})
+
+	result := g.Check(context.Background(), makeInput([]models.Message{makeMsg("user", "jailbreak attempt")}))
+	if result.Pass {
+		t.Fatal("expected fail: prompt_injection should match prompt_attack")
+	}
+	if result.Score != 0.98 {
+		t.Errorf("score = %f, want 0.98", result.Score)
+	}
+}
+
 func TestLakera_FlaggedButNoCategoryMatch(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		json.NewEncoder(w).Encode(map[string]interface{}{
-			"flagged":         true,
-			"categories":      map[string]bool{"prompt_injection": false, "pii": true},
-			"category_scores": map[string]float64{"prompt_injection": 0.1, "pii": 0.9},
+		score := 0.9
+		json.NewEncoder(w).Encode(lakeraResponse{
+			Flagged: true,
+			Breakdown: []lakeraDetectorResult{
+				{DetectorType: "prompt_injection", Detected: false},
+				{DetectorType: "pii", Detected: true, Score: &score},
+			},
 		})
 	}))
 	defer srv.Close()
@@ -96,6 +174,58 @@ func TestLakera_FlaggedButNoCategoryMatch(t *testing.T) {
 	result := g.Check(context.Background(), makeInput([]models.Message{makeMsg("user", "my ssn is 123")}))
 	if !result.Pass {
 		t.Fatal("expected pass: configured category not triggered")
+	}
+}
+
+func TestLakera_FlaggedNoCategoriesConfigured(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		json.NewEncoder(w).Encode(lakeraResponse{
+			Flagged: true,
+			Breakdown: []lakeraDetectorResult{
+				{DetectorType: "pii/names", Detected: true},
+			},
+		})
+	}))
+	defer srv.Close()
+
+	g := New("test-all", map[string]interface{}{
+		"provider": "lakera",
+		"api_key":  "k",
+		"endpoint": srv.URL,
+	})
+
+	result := g.Check(context.Background(), makeInput([]models.Message{makeMsg("user", "John Doe")}))
+	if result.Pass {
+		t.Fatal("expected fail when flagged with no categories filter")
+	}
+	if result.Score != 1.0 {
+		t.Errorf("score = %f, want 1.0", result.Score)
+	}
+}
+
+func TestLakera_LegacyCategories(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"flagged":         true,
+			"categories":      map[string]bool{"prompt_injection": true},
+			"category_scores": map[string]float64{"prompt_injection": 0.92},
+		})
+	}))
+	defer srv.Close()
+
+	g := New("test-legacy", map[string]interface{}{
+		"provider":   "lakera",
+		"api_key":    "k",
+		"endpoint":   srv.URL,
+		"categories": []interface{}{"prompt_injection"},
+	})
+
+	result := g.Check(context.Background(), makeInput([]models.Message{makeMsg("user", "test")}))
+	if result.Pass {
+		t.Fatal("expected fail with legacy categories")
+	}
+	if result.Score != 0.92 {
+		t.Errorf("score = %f, want 0.92", result.Score)
 	}
 }
 
@@ -413,9 +543,11 @@ func TestExternal_PostStage(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		var req lakeraRequest
 		json.NewDecoder(r.Body).Decode(&req)
-		receivedBody = req.Input
-		json.NewEncoder(w).Encode(map[string]interface{}{
-			"flagged": false, "categories": map[string]bool{}, "category_scores": map[string]float64{},
+		if len(req.Messages) > 0 {
+			receivedBody = req.Messages[0].Content
+		}
+		json.NewEncoder(w).Encode(lakeraResponse{
+			Flagged: false,
 		})
 	}))
 	defer srv.Close()
